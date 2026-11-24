@@ -47,7 +47,7 @@ Usage: """
     + __usage__
     + """
 
-At least one glyph or one of --gids, --gids-file, --glyphs, --glyphs-file,
+At least one glyph or one of --keep-everything, --gids, --gids-file, --glyphs, --glyphs-file,
 --text, --text-file, --unicodes, or --unicodes-file, must be specified.
 
 Args:
@@ -63,6 +63,19 @@ Initial glyph set specification
 
 These options populate the initial glyph set. Same option can appear
 multiple times, and the results are accummulated.
+
+--keep-everything
+  Start with all glyphs and Unicode characters, and preserve tables,
+  layout features, names, encodings, hinting, and glyph IDs. Subsequent
+  options can override these settings. This is a retention preset, not
+  a byte-for-byte copy: the normal subsetting and optimization still run.
+
+  Use --glyphs-=, --gids-=, or --unicodes-= to remove from the initial
+  selection; '*' clears that selection. Glyph and Unicode selections are
+  combined, and layout and composite closure can add glyphs back. For
+  example, to keep all encoded characters except U+0025 through U+0027:
+
+    --keep-everything --glyphs-=* --unicodes-=25-27
 
 --gids=<NNN>[,<NNN>...]
   Specify comma/whitespace-separated list of glyph IDs or ranges as decimal
@@ -3695,6 +3708,30 @@ class Options(object):
         posargs = []
         passthru_options = []
         for a in argv:
+            if a == "--keep-everything":
+                self.set(
+                    drop_tables=[],
+                    passthrough_tables=True,
+                    legacy_kern=True,
+                    layout_features=["*"],
+                    layout_scripts=["*"],
+                    hinting=True,
+                    glyph_names=True,
+                    legacy_cmap=True,
+                    symbol_cmap=True,
+                    name_IDs=list(range(0x10000)),
+                    name_legacy=True,
+                    name_languages=["*"],
+                    obfuscate_names=False,
+                    retain_gids=True,
+                    retain_all_variation_sequences=True,
+                    notdef_glyph=True,
+                    notdef_outline=True,
+                    prune_unicode_ranges=False,
+                    prune_codepage_ranges=False,
+                )
+                passthru_options.append(a)
+                continue
             orig_a = a
             if not a.startswith("--"):
                 posargs.append(a)
@@ -4245,6 +4282,7 @@ def main(args=None):
         return 0
 
     options = Options()
+    original_args = args
     try:
         args = options.parse_opts(
             args,
@@ -4276,63 +4314,64 @@ def main(args=None):
         timer.logger.disabled = True
 
     fontfile = args[0]
-    args = args[1:]
+    # parse_opts groups positional arguments first. Restore their order with
+    # selection options, so a later glyph argument can undo a subtraction.
+    remaining = Counter(args)
+    args = []
+    found_fontfile = False
+    for arg in original_args:
+        if not remaining[arg]:
+            continue
+        remaining[arg] -= 1
+        if not found_fontfile and arg == fontfile:
+            found_fontfile = True
+        else:
+            args.append(arg)
 
     subsetter = Subsetter(options=options)
     outfile = None
-    glyphs = []
-    gids = []
-    unicodes = []
-    wildcard_glyphs = False
-    wildcard_unicodes = False
-    text = ""
+    selections = []
     for g in args:
+        if g == "--keep-everything":
+            selections.append(("all", False, "*"))
+            continue
         if g == "*":
-            wildcard_glyphs = True
+            selections.append(("glyphs", False, "*"))
             continue
         if g.startswith("--output-file="):
             outfile = g[14:]
             continue
         if g.startswith("--text="):
-            text += g[7:]
+            selections.append(("text", False, g[7:]))
             continue
         if g.startswith("--text-file="):
             with open(g[12:], encoding="utf-8-sig") as f:
-                text += f.read().replace("\n", "")
+                selections.append(("text", False, f.read().replace("\n", "")))
             continue
-        if g.startswith("--unicodes="):
-            if g[11:] == "*":
-                wildcard_unicodes = True
-            else:
-                unicodes.extend(parse_unicodes(g[11:]))
-            continue
-        if g.startswith("--unicodes-file="):
-            with open(g[16:]) as f:
-                for line in f.readlines():
-                    unicodes.extend(parse_unicodes(line.split("#")[0]))
-            continue
-        if g.startswith("--gids="):
-            gids.extend(parse_gids(g[7:]))
-            continue
-        if g.startswith("--gids-file="):
-            with open(g[12:]) as f:
-                for line in f.readlines():
-                    gids.extend(parse_gids(line.split("#")[0]))
-            continue
-        if g.startswith("--glyphs="):
-            if g[9:] == "*":
-                wildcard_glyphs = True
-            else:
-                glyphs.extend(parse_glyphs(g[9:]))
-            continue
-        if g.startswith("--glyphs-file="):
-            with open(g[14:]) as f:
-                for line in f.readlines():
-                    glyphs.extend(parse_glyphs(line.split("#")[0]))
-            continue
-        glyphs.append(g)
+        for kind, parse in (
+            ("unicodes", parse_unicodes),
+            ("gids", parse_gids),
+            ("glyphs", parse_glyphs),
+        ):
+            if g.startswith((f"--{kind}=", f"--{kind}+=", f"--{kind}-=")):
+                key, value = g.split("=", 1)
+                selections.append(
+                    (kind, key.endswith("-"), "*" if value == "*" else parse(value))
+                )
+                break
+            if g.startswith(f"--{kind}-file="):
+                values = []
+                with open(g.split("=", 1)[1]) as f:
+                    for line in f:
+                        values.extend(parse(line.split("#")[0]))
+                selections.append((kind, False, values))
+                break
+        else:
+            selections.append(("glyphs", False, [g]))
 
-    dontLoadGlyphNames = not options.glyph_names and not glyphs
+    dontLoadGlyphNames = not options.glyph_names and not any(
+        kind == "glyphs" and values != "*" and values for kind, _, values in selections
+    )
     lazy = options.lazy
     font = load_font(
         fontfile, options, dontLoadGlyphNames=dontLoadGlyphNames, lazy=lazy
@@ -4359,25 +4398,56 @@ def main(args=None):
         )
 
     with timer("compile glyph list"):
-        if wildcard_glyphs:
-            glyphs.extend(font.getGlyphOrder())
-        if wildcard_unicodes:
-            for tag in ("cmap", "DMAP"):
-                if tag not in font:
+        glyph_order = font.getGlyphOrder()
+        for kind, remove, values in selections:
+            if kind == "all":
+                subsetter.glyph_names_requested.clear()
+                subsetter.glyph_ids_requested.clear()
+                subsetter.unicodes_requested.clear()
+                subsetter.populate(glyphs=glyph_order)
+                kind = "unicodes"
+            if values == "*" and kind != "text":
+                if remove:
+                    if kind == "unicodes":
+                        subsetter.unicodes_requested.clear()
+                    else:
+                        subsetter.glyph_names_requested.clear()
+                        subsetter.glyph_ids_requested.clear()
                     continue
-                for t in font[tag].tables:
-                    if t.isUnicode():
-                        unicodes.extend(t.cmap.keys())
-                        if t.format in (14, 15):
-                            unicodes.extend(t.uvsDict.keys())
-        assert "" not in glyphs
+                if kind == "glyphs":
+                    values = glyph_order
+                elif kind == "gids":
+                    values = range(len(glyph_order))
+                else:
+                    values = set()
+                    for tag in ("cmap", "DMAP"):
+                        if tag not in font:
+                            continue
+                        for t in font[tag].tables:
+                            if t.isUnicode():
+                                values.update(t.cmap)
+                                if t.format in (14, 15):
+                                    values.update(t.uvsDict)
+            if not remove:
+                subsetter.populate(**{kind: values})
+            elif kind == "unicodes":
+                subsetter.unicodes_requested.difference_update(values)
+            else:
+                if kind == "gids":
+                    gids = set(values)
+                    glyphs = {glyph_order[i] for i in gids if 0 <= i < len(glyph_order)}
+                else:
+                    glyphs = set(values)
+                    gids = {i for i, name in enumerate(glyph_order) if name in glyphs}
+                subsetter.glyph_names_requested.difference_update(glyphs)
+                subsetter.glyph_ids_requested.difference_update(gids)
+        assert "" not in subsetter.glyph_names_requested
 
-    log.info("Text: '%s'" % text)
-    log.info("Unicodes: %s", unicodes)
-    log.info("Glyphs: %s", glyphs)
-    log.info("Gids: %s", gids)
+    log.info("Text: '%s'", "".join(v for k, _, v in selections if k == "text"))
+    log.info("Unicodes: %s", subsetter.unicodes_requested)
+    log.info("Glyphs: %s", subsetter.glyph_names_requested)
+    log.info("Gids: %s", subsetter.glyph_ids_requested)
 
-    subsetter.populate(glyphs=glyphs, gids=gids, unicodes=unicodes, text=text)
     subsetter.subset(font)
 
     save_font(font, outfile, options)

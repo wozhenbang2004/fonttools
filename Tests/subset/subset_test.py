@@ -2724,6 +2724,150 @@ def ttf_path(tmp_path):
     return font_path
 
 
+def test_keep_everything_preserves_font_data(tmp_path, ttf_path):
+    from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+
+    font = TTFont(ttf_path)
+    font["name"].setName("Private name", 400, 3, 1, 0x40C)
+    font["TEST"] = newTable("TEST")
+    font["TEST"].data = b"private table"
+    addOpenTypeFeaturesFromString(
+        font, "feature ss01 { sub period by ellipsis; } ss01;"
+    )
+    font.save(ttf_path)
+    original = TTFont(ttf_path)
+    output = tmp_path / "kept.ttf"
+
+    assert (
+        subset.main([str(ttf_path), "--keep-everything", f"--output-file={output}"])
+        is None
+    )
+    kept = TTFont(output)
+
+    assert kept.getGlyphOrder() == original.getGlyphOrder()
+    assert kept.getBestCmap() == original.getBestCmap()
+    assert set(kept.keys()) == set(original.keys())
+    assert getXML(kept["name"].toXML, kept) == getXML(original["name"].toXML, original)
+    assert kept["TEST"].data == b"private table"
+    assert kept["glyf"][".notdef"].numberOfContours == 2
+    assert (
+        kept["glyf"]["period"].program.getBytecode()
+        == original["glyf"]["period"].program.getBytecode()
+    )
+    assert [r.FeatureTag for r in kept["GSUB"].table.FeatureList.FeatureRecord] == [
+        "ss01"
+    ]
+    assert kept["OS/2"].getUnicodeRanges() == original["OS/2"].getUnicodeRanges()
+    assert kept["OS/2"].getCodePageRanges() == original["OS/2"].getCodePageRanges()
+    assert [(t.platformID, t.platEncID, t.cmap) for t in kept["cmap"].tables] == [
+        (t.platformID, t.platEncID, t.cmap) for t in original["cmap"].tables
+    ]
+    subset.main(
+        [
+            str(ttf_path),
+            "--keep-everything",
+            "--layout-features=",
+            "--no-passthrough-tables",
+            "--name-IDs-=400",
+            f"--output-file={output}",
+        ]
+    )
+    overridden = TTFont(output)
+    assert overridden["GSUB"].table.FeatureList.FeatureRecord == []
+    assert overridden["GSUB"].table.LookupList.Lookup == []
+    assert "TEST" not in overridden
+    assert 400 not in {n.nameID for n in overridden["name"].names}
+
+
+@pytest.mark.parametrize(
+    "selection, expected",
+    [
+        (["--glyphs-=*", "--unicodes-=2e"], {0, 13, 32, 0x2026}),
+        (["--glyphs-=*", "--unicodes-=2e", "--text=."], {0, 13, 32, 46, 0x2026}),
+        (["--glyphs-=*", "--unicodes-=*", "--gids=4"], {46}),
+        (["--gids-=*", "--unicodes-=*", "period"], {46}),
+        (["--gids-=*", "--unicodes-=*", "--text=.", "--unicodes-=2e"], set()),
+        (
+            ["--gids-=*", "--unicodes-=*", "--glyphs=period", "--glyphs-=period"],
+            set(),
+        ),
+        (["--unicodes-=*", "--gids-=5"], {0, 13, 32, 46}),
+        (
+            ["--unicodes-=*", "--glyphs-=ellipsis", "--glyphs+=ellipsis"],
+            {0, 13, 32, 46, 0x2026},
+        ),
+        (
+            ["--glyphs-=*", "--unicodes-=*", "--keep-everything"],
+            {0, 13, 32, 46, 0x2026},
+        ),
+    ],
+)
+def test_keep_everything_selection(tmp_path, ttf_path, selection, expected):
+    output = tmp_path / "selected.ttf"
+    assert (
+        subset.main(
+            [str(ttf_path), "--keep-everything", *selection, f"--output-file={output}"]
+        )
+        is None
+    )
+    kept = TTFont(output)
+    assert set(kept.getBestCmap() or {}) == expected
+    original = TTFont(ttf_path)
+    for codepoint, glyph in (kept.getBestCmap() or {}).items():
+        assert kept.getGlyphID(glyph) == original.getGlyphID(
+            original.getBestCmap()[codepoint]
+        )
+    if 0x2026 in expected:
+        # Its component is still needed even when U+002E was removed from cmap.
+        assert kept["glyf"]["period"].numberOfContours == 1
+
+
+@pytest.mark.parametrize("keep_last", [False, True])
+def test_keep_everything_option_order(tmp_path, ttf_path, keep_last):
+    output = tmp_path / "ordered.ttf"
+    overrides = ["--no-hinting", "--drop-tables=DSIG", "--name-IDs=1"]
+    args = (
+        overrides + ["--keep-everything"]
+        if keep_last
+        else ["--keep-everything"] + overrides
+    )
+    assert subset.main([str(ttf_path), *args, f"--output-file={output}"]) is None
+    kept = TTFont(output)
+
+    assert ("DSIG" in kept) == keep_last
+    assert ("fpgm" in kept) == keep_last
+    assert bool(kept["glyf"]["period"].program.getBytecode()) == keep_last
+    name_ids = {n.nameID for n in kept["name"].names}
+    assert name_ids == (
+        {n.nameID for n in TTFont(ttf_path)["name"].names} if keep_last else {1}
+    )
+
+
+def test_keep_everything_cff(tmp_path):
+    source = pathlib.Path(__file__).parent / "data" / "Lobster.subset.otf"
+    output = tmp_path / "kept.otf"
+    assert (
+        subset.main([str(source), "--keep-everything", f"--output-file={output}"])
+        is None
+    )
+    original = TTFont(source)
+    kept = TTFont(output)
+    assert kept.getGlyphOrder() == original.getGlyphOrder()
+    assert kept.getBestCmap() == original.getBestCmap()
+    assert getXML(kept["name"].toXML, kept) == getXML(original["name"].toXML, original)
+    assert [r.FeatureTag for r in kept["GSUB"].table.FeatureList.FeatureRecord] == [
+        r.FeatureTag for r in original["GSUB"].table.FeatureList.FeatureRecord
+    ]
+
+
+def test_subset_text_asterisk(tmp_path, ttf_path):
+    output = tmp_path / "asterisk.ttf"
+    subset.main([str(ttf_path), "--text=*", f"--output-file={output}"])
+    font = TTFont(output)
+    assert font.getBestCmap() is None
+    assert font.getGlyphOrder() == [".notdef"]
+
+
 def test_subset_empty_glyf(tmp_path, ttf_path):
     subset_path = tmp_path / (ttf_path.name + ".subset")
     # only keep empty .notdef and space glyph, resulting in an empty glyf table

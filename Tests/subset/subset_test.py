@@ -2306,6 +2306,135 @@ def test_subset_feature_variations_null_substitution(
         assert lookup.SubTable[0].mapping == {"dollar": "dollar.rvrn"}
 
 
+@pytest.fixture
+def gdef_caret_font():
+    from fontTools.otlLib.builder import buildAttachList, buildLigCaretList
+
+    fb = FontBuilder(1000)
+    order = [".notdef", "f", "i", "f_f_i"]
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap({ord("f"): "f", ord("i"): "i"})
+    glyphs = {}
+    for name in order:
+        pen = TTGlyphPen(None)
+        pen.moveTo((0, 0))
+        pen.lineTo((400, 0))
+        pen.lineTo((400, 700))
+        pen.lineTo((0, 700))
+        pen.closePath()
+        glyphs[name] = pen.glyph()
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics({name: (1000, 0) for name in order})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": "TestGDEFCarets", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.addOpenTypeFeatures("feature liga { sub f f i by f_f_i; } liga;")
+    table = ot.GDEF()
+    table.Version = 0x00010000
+    table.GlyphClassDef = table.MarkAttachClassDef = None
+    mapping = fb.font.getReverseGlyphMap()
+    table.AttachList = buildAttachList({"f_f_i": [1]}, mapping)
+    table.LigCaretList = buildLigCaretList({"f_f_i": [200]}, {"f_f_i": [1]}, mapping)
+    fb.font["GDEF"] = newTable("GDEF")
+    fb.font["GDEF"].table = table
+    return fb.font
+
+
+@pytest.mark.parametrize("hinting", [False, True])
+@pytest.mark.parametrize("delta", [None, 1, 3, 9])
+def test_subset_gdef_hinting(gdef_caret_font, hinting, delta):
+    from fontTools.otlLib.builder import buildDevice
+
+    font = gdef_caret_font
+    caret = font["GDEF"].table.LigCaretList.LigGlyph[0].CaretValue[0]
+    caret.Format = 3
+    caret.DeviceTable = None if delta is None else buildDevice({10: delta})
+    options = subset.Options()
+    options.hinting = hinting
+    options.glyph_names = True
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(text="ffi")
+    subsetter.subset(font)
+
+    output = io.BytesIO()
+    font.save(output)
+    output.seek(0)
+    table = TTFont(output)["GDEF"].table
+    assert (table.AttachList is not None) == hinting
+    if hinting:
+        assert table.AttachList.AttachPoint[0].PointIndex == [1]
+    assert table.LigCaretList.Coverage.glyphs == ["f_f_i"]
+    first, second = table.LigCaretList.LigGlyph[0].CaretValue
+    assert first.Coordinate == 200
+    assert first.Format == (3 if hinting else 1)
+    if hinting and delta is not None:
+        assert first.DeviceTable.DeltaValue == [delta]
+    assert second.Format == 2
+    assert second.CaretValuePoint == 1
+
+
+@pytest.mark.parametrize("hinting", [False, True])
+def test_subset_gdef_hinting_preserves_variations(gdef_caret_font, hinting):
+    from fontTools.varLib.builder import (
+        buildVarData,
+        buildVarDevTable,
+        buildVarRegionList,
+        buildVarStore,
+    )
+    from fontTools.varLib.varStore import VarStoreInstancer
+
+    font = gdef_caret_font
+    FontBuilder(font=font).setupFvar(
+        axes=[("wght", 100, 400, 900, "Weight")], instances=[]
+    )
+    table = font["GDEF"].table
+    table.Version = 0x00010003
+    table.MarkGlyphSetsDef = None
+    table.VarStore = buildVarStore(
+        buildVarRegionList([{"wght": (0, 1, 1)}], ["wght"]),
+        [buildVarData([0], [[99], [150]], optimize=False)],
+    )
+    caret = table.LigCaretList.LigGlyph[0].CaretValue[0]
+    caret.Format = 3
+    caret.DeviceTable = buildVarDevTable(1)
+    options = subset.Options()
+    options.hinting = hinting
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(text="ffi")
+    subsetter.subset(font)
+
+    output = io.BytesIO()
+    font.save(output)
+    output.seek(0)
+    font = TTFont(output)
+    table = font["GDEF"].table
+    assert (table.AttachList is not None) == hinting
+    caret = table.LigCaretList.LigGlyph[0].CaretValue[0]
+    assert caret.Format == 3
+    assert caret.Coordinate == 200
+    device = caret.DeviceTable
+    assert device.DeltaFormat == 0x8000
+    assert (device.StartSize, device.EndSize) == (0, 0)
+    instancer = VarStoreInstancer(table.VarStore, font["fvar"].axes, {"wght": 1})
+    assert caret.Coordinate + instancer[0] == 350
+
+
+@pytest.mark.parametrize("hinting", [False, True])
+def test_subset_gdef_hinting_drops_empty_table(gdef_caret_font, hinting):
+    font = gdef_caret_font
+    font["GDEF"].table.LigCaretList = None
+    options = subset.Options()
+    options.hinting = hinting
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(text="ffi")
+    subsetter.subset(font)
+    output = io.BytesIO()
+    font.save(output)
+    output.seek(0)
+    assert ("GDEF" in TTFont(output)) == hinting
+
+
 # TODO test_subset_feature_variations_drop_from_end_empty_records
 # https://github.com/fonttools/fonttools/issues/1881#issuecomment-619415044
 

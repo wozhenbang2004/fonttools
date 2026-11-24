@@ -2446,6 +2446,16 @@ def _pruneGDEF(font):
 @_add_method(ttLib.getTableClass("GDEF"))
 def prune_post_subset(self, font, options):
     table = self.table
+    if not options.hinting:
+        table.AttachList = None
+        if table.LigCaretList:
+            for glyph in table.LigCaretList.LigGlyph:
+                for caret in glyph.CaretValue:
+                    if caret is not None and caret.Format == 3:
+                        device = caret.DeviceTable
+                        if device is None or device.is_hinting():
+                            caret.Format = 1
+                            del caret.DeviceTable
     # XXX check these against OTS
     if table.LigCaretList and not table.LigCaretList.LigGlyphCount:
         table.LigCaretList = None
